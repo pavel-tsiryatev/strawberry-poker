@@ -1,0 +1,106 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Тесты (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Системные библиотеки
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxi-dev libgl1-mesa-dev libasound2-dev
+      - run: cargo test --release
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: strawberry-poker-linux
+          path: target/release/strawberry-poker
+
+  windows:
+    name: Windows (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: strawberry-poker-windows
+          path: target/release/strawberry-poker.exe
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: strawberry-poker-macos
+          path: target/release/strawberry-poker
+
+  android:
+    name: Android (.apk)
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: 27.2.12479018
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+      - name: Android SDK и NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION" > /dev/null
+      - name: Установка cargo-quad-apk
+        run: cargo install --git https://github.com/not-fl3/cargo-quad-apk --locked
+      - name: Сборка APK
+        run: NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION" cargo quad-apk build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: strawberry-poker-android
+          path: target/android-artifacts/release/apk/*.apk
+
+  release:
+    name: Релиз
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, windows, macos, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Переименование файлов
+        run: |
+          mkdir out
+          cp dist/strawberry-poker-windows/strawberry-poker.exe out/strawberry-poker-windows.exe
+          cp dist/strawberry-poker-linux/strawberry-poker out/strawberry-poker-linux
+          cp dist/strawberry-poker-macos/strawberry-poker out/strawberry-poker-macos
+          cp dist/strawberry-poker-android/*.apk out/strawberry-poker.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
