@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-macroquad = "0.4"
+fontdue = "0.9"
+miniquad = "0.4"
 nanoserde = "0.1"
 
 [profile.release]

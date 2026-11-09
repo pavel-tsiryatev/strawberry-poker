@@ -5,15 +5,23 @@
 mod gfx;
 mod scene;
 
+#[allow(dead_code)] // общий API движка: не всё используется самой игрой
+mod engine;
+
+use std::cell::RefCell;
+
+use engine::canvas::Canvas;
+use engine::input;
+use engine::prelude::*;
 use gfx::*;
-use macroquad::prelude::*;
-use scene::{RX, RZ, Scene};
+use miniquad::conf::Conf;
+use miniquad::{EventHandler, KeyMods, TouchPhase};
+use scene::{Scene, TX, TZ};
 use strawberry_poker::client::{Client, ClientEvent, local_ips};
 use strawberry_poker::eval::evaluate;
 use strawberry_poker::proto::*;
 use strawberry_poker::server::{self, ServerConfig, ServerHandle};
 
-const SEAT_ANGLES: [f32; MAX_SEATS] = [90.0, 150.0, 210.0, 270.0, 330.0, 30.0];
 const AVATAR_COLORS: [u32; 10] = [
     0xe8505b, 0xf9a03f, 0x4cc38a, 0x3d8bfd, 0xa66cff, 0xff6fb5, 0x2ec4d6, 0xc0ca33, 0xff8a65, 0x7e57c2,
 ];
@@ -139,31 +147,81 @@ struct App {
     dragging: bool,
     confirm_leave: bool,
     scene: Scene,
+    /// камера текущего кадра
+    camera: Camera,
     last_turn_key: (u64, u64),
 }
 
-fn ellipse_point(d: usize, kx: f32, kz: f32, extra_deg: f32) -> Vec3 {
-    let a = (SEAT_ANGLES[d] + extra_deg).to_radians();
-    vec3(kx * a.cos(), 0.0, kz * a.sin())
-}
+/// Места у прямоугольного стола (0 — вы, дальше по часовой стрелке).
+const SEATS_AT: [(f32, f32); MAX_SEATS] = [
+    (0.0, TZ),
+    (-TX, 1.45),
+    (-TX, -1.45),
+    (0.0, -TZ),
+    (TX, -1.45),
+    (TX, 1.45),
+];
 
+/// Точка у края стола напротив игрока.
+fn edge(d: usize) -> Vec3 {
+    let (x, z) = SEATS_AT[d];
+    vec3(x, 0.0, z)
+}
+/// Над стулом — сюда «висит» голографическая панель.
 fn seat_world(d: usize) -> Vec3 {
-    ellipse_point(d, RX + 0.95, RZ + 1.0, 0.0) + Vec3::Y * 0.4
+    let e = edge(d);
+    let out = vec3(e.x.signum() * 1.1, 0.0, if e.x == 0.0 { e.z.signum() * 0.9 } else { 0.0 });
+    // дальние места выше, ближние ниже — панели не налезают друг на друга
+    let lift = match d {
+        3 => 2.3,
+        2 | 4 => 2.6,
+        _ => 1.0,
+    };
+    e + out + Vec3::Y * lift
 }
 fn bet_world(d: usize) -> Vec3 {
-    ellipse_point(d, RX * 0.6, RZ * 0.55, 0.0)
+    let e = edge(d);
+    vec3(e.x * 0.55, 0.0, e.z * 0.5)
 }
 fn hole_world(d: usize) -> Vec3 {
-    ellipse_point(d, RX * 0.8, RZ * 0.76, 0.0)
+    let e = edge(d);
+    vec3(e.x * 0.76, 0.0, e.z * 0.72)
 }
 fn dealer_world(d: usize) -> Vec3 {
-    ellipse_point(d, RX * 0.76, RZ * 0.70, if d == 0 { -16.0 } else { 15.0 })
+    let e = edge(d);
+    let side = if e.x == 0.0 { vec3(-1.3, 0.0, 0.0) } else { vec3(0.0, 0.0, 0.9) };
+    vec3(e.x * 0.7, 0.0, e.z * 0.65) + side
 }
-const POT_WORLD: Vec3 = Vec3::new(0.0, 0.0, -1.2);
+/// Личная стопка фишек у края стола.
+fn stack_world(d: usize) -> Vec3 {
+    let e = edge(d);
+    let side = if e.x == 0.0 { vec3(1.5, 0.0, 0.0) } else { vec3(0.0, 0.0, -0.9) };
+    vec3(e.x * 0.86, 0.0, e.z * 0.84) + side
+}
+const POT_WORLD: Vec3 = Vec3::new(0.0, 0.0, -1.25);
 const DECK_WORLD: Vec3 = Vec3::new(0.0, 0.3, -1.0);
 
 fn board_world(i: usize) -> Vec3 {
-    vec3((i as f32 - 2.0) * 1.12, 0.0, 0.3)
+    vec3((i as f32 - 2.0) * 1.12, 0.0, 0.05)
+}
+
+/// Затемнение по краям кадра — атмосфера тёмной комнаты.
+fn vignette(g: &G) {
+    let steps = 10;
+    for i in 0..steps {
+        let t = i as f32 / steps as f32;
+        let a = 0.06 * (1.0 - t);
+        let (dx, dy) = (g.w * 0.12 * t, g.h * 0.12 * t);
+        g.rect(0.0, 0.0, g.w, dy + 8.0, Color::new(0.02, 0.0, 0.05, a));
+        g.rect(0.0, g.h - dy - 8.0, g.w, dy + 8.0, Color::new(0.02, 0.0, 0.05, a));
+        g.rect(0.0, 0.0, dx + 8.0, g.h, Color::new(0.02, 0.0, 0.05, a));
+        g.rect(g.w - dx - 8.0, 0.0, dx + 8.0, g.h, Color::new(0.02, 0.0, 0.05, a));
+    }
+}
+
+/// Своя панель — справа внизу, как «You» на референсе.
+fn hero_panel_pos(g: &G) -> Vec2 {
+    vec2(g.w / 2.0 + 360.0, g.h - 118.0)
 }
 
 fn seat_disp(you: i32, seat: usize) -> usize {
@@ -183,6 +241,7 @@ impl App {
             raise_to: 0,
             dragging: false,
             confirm_leave: false,
+            camera: Scene::table_camera(),
             scene,
             last_turn_key: (0, 0),
         }
@@ -360,18 +419,10 @@ impl App {
 
     // ---------------------------------------------------------- общие элементы
 
-    fn draw_background(&self, g: &G) {
-        g.vgradient(0.0, 0.0, g.w, g.h, rgb(0x161d3d), rgb(0x04060d));
-        for i in 0..8 {
-            let k = i as f32 / 8.0;
-            g.ellipse(g.w / 2.0, g.h * 0.5, g.w * 0.55 - k * 300.0, g.h * 0.55 - k * 180.0, alpha(rgb(0x2a3a7a), 0.025));
-        }
-    }
-
     fn text_field(&mut self, g: &G, x: f32, y: f32, w: f32, h: f32, field: Field, placeholder: &str) {
         let focused = self.field == field;
         g.rrect(x, y, w, h, 12.0, rgb(0x0a0e1c));
-        g.rrect_lines(x, y, w, h, 12.0, 2.0, if focused { K_GOLD } else { rgb(0x34407a) });
+        g.rrect_lines(x, y, w, h, 12.0, 2.0, if focused { K_GOLD } else { rgb(0x7a6cff) });
         let value = match field {
             Field::Name => self.settings.name.clone(),
             Field::Ip => self.settings.last_ip.clone(),
@@ -420,41 +471,27 @@ impl App {
         }
     }
 
-    fn avatar(&self, g: &G, x: f32, y: f32, r: f32, avatar: u32, name: &str, dim: bool) {
-        g.circle(x + 2.0, y + 4.0, r + 4.0, alpha(BLACK, 0.5));
-        g.circle(x, y, r + 4.0, K_GOLD_DARK);
-        let col = rgb(AVATAR_COLORS[avatar as usize % AVATAR_COLORS.len()]);
-        g.circle(x, y, r, darken(col, 0.25));
-        g.circle(x, y - r * 0.1, r * 0.86, col);
-        let initial: String = name.chars().next().unwrap_or('?').to_uppercase().collect();
-        g.text_shadow(&initial, x, y - r * 0.06, r * 0.82, WHITE, Align::Center, true);
-        if dim {
-            g.circle(x, y, r + 4.0, alpha(rgb(0x05070f), 0.55));
-        }
-    }
-
     // ---------------------------------------------------------- меню
 
     fn draw_menu(&mut self, g: &G) {
         // медленно вращающийся стол на фоне
-        let t = get_time() as f32 * 0.12;
-        let cam = Camera3D {
-            position: vec3(t.sin() * 13.0, 7.5, t.cos() * 13.0),
-            target: vec3(0.0, -0.5, 0.0),
+        // камера медленно «дышит» над столом
+        let t = get_time() as f32 * 0.15;
+        let cam = Camera {
+            position: vec3(t.sin() * 3.0, 7.0 + (t * 0.7).sin() * 0.5, 12.0),
+            target: vec3(0.0, 0.5, -2.0),
             up: Vec3::Y,
-            fovy: 40f32.to_radians(),
-            z_near: 2.0,
-            z_far: 60.0,
-            ..Default::default()
+            fovy: 52f32.to_radians(),
+            near: 0.5,
+            far: 60.0,
         };
-        set_camera(&cam);
-        self.scene.draw_table();
+        self.camera = self.scene.begin(cam);
         for i in 0..5 {
             self.scene.draw_card(board_world(i), 0.0, 1.0, Some((i * 9 + 12) as u8 % 52), 1.0, 0.0);
         }
         self.scene.draw_chips(POT_WORLD, 4000, 100);
-        set_default_camera();
-        g.rect(0.0, 0.0, g.w, g.h, alpha(rgb(0x04060d), 0.45));
+        g.ui();
+        g.rect(0.0, 0.0, g.w, g.h, alpha(rgb(0x05040c), 0.35));
 
         let cx = g.w / 2.0;
         g.strawberry(cx - 290.0, 74.0, 70.0, 1.0);
@@ -463,8 +500,7 @@ impl App {
 
         let (pw, ph) = (560.0, 440.0);
         let (px, py) = (cx - pw / 2.0, 150.0);
-        g.rrect(px, py, pw, ph, 24.0, alpha(K_PANEL, 0.92));
-        g.rrect_lines(px, py, pw, ph, 24.0, 2.0, alpha(K_GOLD, 0.5));
+        g.glass(px, py, pw, ph, 24.0, K_NEON, true);
 
         match self.screen {
             Screen::Menu => {
@@ -482,12 +518,12 @@ impl App {
                         self.settings.avatar = i;
                     }
                 }
-                if g.button(px + 40.0, py + 256.0, pw - 80.0, 66.0, "Создать стол", rgb(0x23915a), true) {
+                if g.button(px + 40.0, py + 256.0, pw - 80.0, 66.0, "Создать стол", K_NEON, true) {
                     self.set_field(Field::None);
                     self.screen = Screen::Host;
                     self.message = None;
                 }
-                if g.button(px + 40.0, py + 340.0, pw - 80.0, 66.0, "Подключиться к другу", rgb(0x2a6fd6), true) {
+                if g.button(px + 40.0, py + 340.0, pw - 80.0, 66.0, "Подключиться к другу", K_CYAN, true) {
                     self.set_field(Field::None);
                     self.screen = Screen::Join;
                     self.message = None;
@@ -504,9 +540,9 @@ impl App {
                 for (k, (label, value)) in rows.iter().enumerate() {
                     let y = py + 86.0 + k as f32 * 72.0;
                     g.text(label, px + 40.0, y + 27.0, 19.0, K_TEXT, Align::Left, false);
-                    let minus = g.button(px + pw - 270.0, y, 54.0, 54.0, "−", rgb(0x34407a), true);
+                    let minus = g.button(px + pw - 270.0, y, 54.0, 54.0, "−", rgb(0x7a6cff), true);
                     g.text(value, px + pw - 146.0, y + 27.0, 21.0, K_GOLD, Align::Center, true);
-                    let plus = g.button(px + pw - 94.0, y, 54.0, 54.0, "+", rgb(0x34407a), true);
+                    let plus = g.button(px + pw - 94.0, y, 54.0, 54.0, "+", rgb(0x7a6cff), true);
                     let (val, max) = match k {
                         0 => (&mut self.settings.blinds, BLINDS.len() - 1),
                         1 => (&mut self.settings.stack, STACK_BB.len() - 1),
@@ -521,10 +557,10 @@ impl App {
                 }
                 g.text("Боты займут свободные места;", cx, py + 316.0, 15.0, K_MUTED, Align::Center, false);
                 g.text("подключившиеся друзья сядут вместо них.", cx, py + 338.0, 15.0, K_MUTED, Align::Center, false);
-                if g.button(px + 40.0, py + 362.0, 160.0, 60.0, "Назад", rgb(0x2b3560), true) {
+                if g.button(px + 40.0, py + 362.0, 160.0, 60.0, "Назад", rgb(0x7a6cff), true) {
                     self.screen = Screen::Menu;
                 }
-                if g.button(px + 216.0, py + 362.0, pw - 256.0, 60.0, "Открыть стол", rgb(0x23915a), true) {
+                if g.button(px + 216.0, py + 362.0, pw - 256.0, 60.0, "Открыть стол", K_NEON, true) {
                     self.host_game();
                 }
             }
@@ -539,7 +575,7 @@ impl App {
                 for (k, key) in keys.iter().enumerate() {
                     let x = kx0 + (k % 3) as f32 * (kw + 8.0);
                     let y = py + 166.0 + (k / 3) as f32 * (kh + 6.0);
-                    if g.button(x, y, kw, kh, key, rgb(0x283260), true) {
+                    if g.button(x, y, kw, kh, key, rgb(0x7a6cff), true) {
                         if *key == "⌫" {
                             self.settings.last_ip.pop();
                         } else if self.settings.last_ip.len() < 40 {
@@ -549,17 +585,17 @@ impl App {
                 }
                 let bx = kx0 + 3.0 * (kw + 8.0) + 8.0;
                 let bw = px + pw - 40.0 - bx;
-                if g.button(bx, py + 166.0, bw, 44.0, ": порт", rgb(0x283260), true) {
+                if g.button(bx, py + 166.0, bw, 44.0, ": порт", rgb(0x7a6cff), true) {
                     self.settings.last_ip.push(':');
                 }
-                if g.button(bx, py + 216.0, bw, 44.0, "Очистить", rgb(0x283260), true) {
+                if g.button(bx, py + 216.0, bw, 44.0, "Очистить", rgb(0x7a6cff), true) {
                     self.settings.last_ip.clear();
                 }
-                if g.button(px + 40.0, py + 370.0, 160.0, 56.0, "Назад", rgb(0x2b3560), true) {
+                if g.button(px + 40.0, py + 370.0, 160.0, 56.0, "Назад", rgb(0x7a6cff), true) {
                     self.set_field(Field::None);
                     self.screen = Screen::Menu;
                 }
-                if g.button(px + 216.0, py + 370.0, pw - 256.0, 56.0, "Подключиться", rgb(0x2a6fd6), true) {
+                if g.button(px + 216.0, py + 370.0, pw - 256.0, 56.0, "Подключиться", K_CYAN, true) {
                     self.set_field(Field::None);
                     self.join_game();
                 }
@@ -591,16 +627,15 @@ impl App {
 
     fn draw_table(&mut self, g: &G) {
         let now = get_time();
-        let cam = Scene::camera();
-        set_camera(&cam);
-        self.scene.draw_table();
+        let cam = self.scene.begin(Scene::table_camera());
+        self.camera = cam;
         let Some(net) = &self.net else { return };
         let Some(v) = net.view.clone() else {
-            set_default_camera();
+            g.ui();
             let msg = if net.connected { "Садимся за стол…" } else { "Подключение…" };
             g.rect(0.0, 0.0, g.w, g.h, alpha(BLACK, 0.4));
             g.text_shadow(msg, g.w / 2.0, g.h / 2.0, 30.0, K_GOLD, Align::Center, true);
-            if g.button(g.w / 2.0 - 90.0, g.h / 2.0 + 50.0, 180.0, 56.0, "Отмена", rgb(0x2b3560), true) {
+            if g.button(g.w / 2.0 - 90.0, g.h / 2.0 + 50.0, 180.0, 56.0, "Отмена", rgb(0x7a6cff), true) {
                 self.leave(None);
             }
             return;
@@ -664,6 +699,8 @@ impl App {
             if s.bet > 0 {
                 self.scene.draw_chips(bet_world(d), s.bet, v.bb);
             }
+            // личный стек у края стола
+            self.scene.draw_chips(stack_world(d), s.chips, v.bb * 4);
             if v.dealer == seat as i32 && v.hand_no > 0 {
                 self.scene.draw_dealer(dealer_world(d));
             }
@@ -681,11 +718,12 @@ impl App {
             self.scene.draw_chips(POT_WORLD, collected, v.bb);
         }
 
-        set_default_camera();
+        g.ui();
+        vignette(g);
         self.draw_table_hud(g, &v, &cam, now);
     }
 
-    fn draw_table_hud(&mut self, g: &G, v: &View, cam: &Camera3D, now: f64) {
+    fn draw_table_hud(&mut self, g: &G, v: &View, cam: &Camera, now: f64) {
         let you = v.you;
         let since_result = (now - self.anim.result_time) as f32;
         let result = v.result.as_ref();
@@ -712,16 +750,13 @@ impl App {
         // ---- места
         for seat in 0..MAX_SEATS {
             let d = seat_disp(you, seat);
-            let mut pos = Scene::project(cam, g, seat_world(d));
-            if d == 0 {
-                pos.y = pos.y.min(g.h - 120.0);
-            }
+            let mut pos = if d == 0 { hero_panel_pos(g) } else { Scene::project(cam, g, seat_world(d)) };
             pos.y = pos.y.max(78.0);
             if !v.seats[seat].occupied {
-                g.circle(pos.x, pos.y, 40.0, alpha(BLACK, 0.35));
-                g.ring(pos.x, pos.y, 40.0, 2.0, alpha(K_MUTED, 0.5));
+                g.rrect(pos.x - 70.0, pos.y - 26.0, 140.0, 52.0, 14.0, Color::new(0.06, 0.06, 0.15, 0.35));
+                g.rrect_lines(pos.x - 70.0, pos.y - 26.0, 140.0, 52.0, 14.0, 1.5, alpha(K_NEON, 0.35));
                 if v.host {
-                    if g.button(pos.x - 50.0, pos.y - 18.0, 100.0, 36.0, "+ Бот", rgb(0x34407a), true) {
+                    if g.button(pos.x - 54.0, pos.y - 18.0, 108.0, 36.0, "+ Бот", K_NEON, true) {
                         self.send(ClientMsg::new("add_bot"));
                     }
                 } else {
@@ -737,7 +772,7 @@ impl App {
             if since_result > 0.5 {
                 let a = ((since_result - 0.5) / 0.3).clamp(0.0, 1.0);
                 let lines: Vec<&str> = r.text.lines().take(3).collect();
-                let p = Scene::project(cam, g, vec3(0.0, 0.0, 1.5));
+                let p = Scene::project(cam, g, vec3(0.0, 1.6, -1.6));
                 let h = 18.0 + lines.len() as f32 * 26.0;
                 let wmax = lines.iter().map(|l| g.text_w(l, 18.0, true)).fold(0.0, f32::max) + 40.0;
                 g.rrect(p.x - wmax / 2.0, p.y - h / 2.0, wmax, h, 14.0, alpha(rgb(0x0b0f1e), 0.88 * a));
@@ -751,8 +786,7 @@ impl App {
         // ---- свои карты крупно
         if you >= 0 {
             let me = &v.seats[you as usize];
-            let mut pos = Scene::project(cam, g, seat_world(0));
-            pos.y = pos.y.min(g.h - 120.0);
+            let pos = vec2(g.w / 2.0 - 140.0, g.h - 140.0);
             if me.cards.len() == 2 && !me.folded {
                 let n_dealt = v.seats.iter().filter(|s| s.has_cards || s.in_hand).count().max(1);
                 let order = (you as usize + MAX_SEATS - v.dealer.max(0) as usize) % MAX_SEATS;
@@ -767,7 +801,7 @@ impl App {
                     }
                     let prog = ease_out(((now - t0) / 0.3) as f32);
                     let (w, h) = (84.0, 118.0);
-                    let target = vec2(pos.x + 62.0 + k as f32 * 64.0, pos.y - 84.0);
+                    let target = vec2(pos.x + 62.0 + k as f32 * 64.0, pos.y - 84.0 - if v.to_act == v.you { 20.0 } else { 0.0 });
                     let from = vec2(g.w / 2.0, g.h * 0.3);
                     let at = from.lerp(target, prog);
                     let flip = (((now - t0) - 0.3) / 0.3) as f32;
@@ -812,7 +846,7 @@ impl App {
                 let in_hand_now = me.in_hand && result.is_none();
                 if me.chips == 0 && !in_hand_now {
                     let label = format!("Докупиться на {}", fmt_chips(v.stack));
-                    if g.button(g.w - 300.0, g.h - 84.0, 280.0, 64.0, &label, rgb(0x23915a), true) {
+                    if g.button(g.w - 300.0, g.h - 84.0, 280.0, 64.0, &label, K_NEON, true) {
                         self.send(ClientMsg::new("rebuy"));
                     }
                 }
@@ -827,6 +861,7 @@ impl App {
         }
     }
 
+    /// Голографическая панель игрока: стекло, неоновая рамка, аватар, имя, фишки.
     #[allow(clippy::too_many_arguments)]
     fn draw_seat(&mut self, g: &G, v: &View, seat: usize, pos: Vec2, now: f64, recv: f64, since_result: f32) {
         let s = &v.seats[seat];
@@ -834,19 +869,56 @@ impl App {
         let is_turn = v.to_act == seat as i32 && result.is_none();
         let winner = result.and_then(|r| r.wins.iter().find(|w| w.seat as usize == seat));
         let dim = s.folded || (!s.in_hand && v.hand_no > 0 && v.started) || !s.connected;
-        let r = 40.0;
+        let me = seat as i32 == v.you;
 
+        let (pw, ph) = (196.0, 70.0);
+        let (px, py) = (pos.x - pw / 2.0, pos.y - ph / 2.0);
+        let accent = if winner.is_some() {
+            K_GOLD
+        } else if is_turn || me {
+            K_CYAN
+        } else {
+            K_NEON
+        };
         if winner.is_some() {
             let pulse = 0.5 + 0.5 * (now as f32 * 6.0).sin();
-            g.circle(pos.x, pos.y, r + 14.0 + pulse * 4.0, alpha(K_GOLD, 0.25));
+            g.glow(px - 6.0, py - 6.0, pw + 12.0, ph + 12.0, 18.0, K_GOLD, 0.4 + 0.4 * pulse);
         }
-        self.avatar(g, pos.x, pos.y, r, s.avatar, &s.name, dim);
-        if winner.is_some() {
-            g.ring(pos.x, pos.y, r + 4.0, 4.0, K_GOLD);
-        } else if seat as i32 == v.you {
-            g.ring(pos.x, pos.y, r + 4.0, 3.0, rgb(0x9fe8bf));
+        g.glass(px, py, pw, ph, 14.0, if dim { alpha(accent, 0.5) } else { accent }, is_turn || winner.is_some());
+
+        // аватар-силуэт в кружке
+        let (ax, ay, ar) = (px + 36.0, py + ph / 2.0, 24.0);
+        let col = rgb(AVATAR_COLORS[s.avatar as usize % AVATAR_COLORS.len()]);
+        g.circle(ax, ay, ar, Color::new(col.r * 0.35, col.g * 0.35, col.b * 0.5, 0.9));
+        g.circle(ax, ay - 6.0, ar * 0.38, alpha(lighten(col, 0.3), 0.95));
+        g.ellipse(ax, ay + 14.0, ar * 0.62, ar * 0.45, alpha(lighten(col, 0.3), 0.95));
+        g.ring(ax, ay, ar + 1.5, 2.5, alpha(lighten(accent, 0.3), 0.9));
+        let initial: String = s.name.chars().next().unwrap_or('?').to_uppercase().collect();
+        g.text_shadow(&initial, ax + ar * 0.62, ay + ar * 0.62, 13.0, WHITE, Align::Center, true);
+
+        // имя и фишки
+        let tx = px + 70.0;
+        let mut name = s.name.clone();
+        while g.text_w(&name, 16.0, true) > pw - 82.0 && name.chars().count() > 2 {
+            name.pop();
+        }
+        g.text(&name, tx, py + 22.0, 16.0, if dim { K_MUTED } else { K_TEXT }, Align::Left, true);
+        let chips_c = if s.all_in { K_ORANGE } else { lighten(K_CYAN, 0.35) };
+        g.text(&fmt_chips(s.chips), tx, py + 47.0, 20.0, chips_c, Align::Left, true);
+        // индикатор связи, как зелёная точка на референсе
+        let dot = if !s.connected { K_RED } else if s.is_bot { K_NEON } else { rgb(0x3ddc84) };
+        g.circle(px + pw - 14.0, py + 14.0, 4.5, dot);
+        if s.is_bot {
+            g.text("БОТ", px + pw - 14.0, py + ph - 14.0, 10.0, alpha(K_MUTED, 0.9), Align::Right, true);
+        }
+        if dim {
+            g.rrect(px, py, pw, ph, 14.0, alpha(rgb(0x05040c), 0.45));
+        }
+        if !s.connected {
+            g.text_shadow("нет связи", pos.x, py + ph + 12.0, 13.0, K_RED, Align::Center, true);
         }
 
+        // таймер хода — полоска по низу панели
         if is_turn {
             let total = v.turn_total_ms.max(1) as f64 / 1000.0;
             let left = v.turn_left_ms as f64 / 1000.0 - (now - recv);
@@ -856,68 +928,47 @@ impl App {
             } else {
                 mix(rgb(0xff4d4d), rgb(0xffd23f), frac * 2.0)
             };
-            g.ring(pos.x, pos.y, r + 10.0, 6.0, alpha(BLACK, 0.5));
-            g.arc(pos.x, pos.y, r + 10.0, 6.0, -90.0, 360.0 * frac, c);
+            g.rrect(px + 12.0, py + ph - 7.0, pw - 24.0, 4.0, 2.0, alpha(BLACK, 0.5));
+            g.rrect(px + 12.0, py + ph - 7.0, (pw - 24.0) * frac, 4.0, 2.0, c);
         }
 
-        // табличка
-        let (pw, ph) = (150.0, 48.0);
-        let px = pos.x - pw / 2.0;
-        let py = pos.y + r - 6.0;
-        g.rrect(px, py + 3.0, pw, ph, 12.0, alpha(BLACK, 0.45));
-        g.rrect(px, py, pw, ph, 12.0, if is_turn { rgb(0x23305e) } else { rgb(0x111830) });
-        g.rrect_lines(px, py, pw, ph, 12.0, 1.5, if is_turn { K_GOLD } else { alpha(rgb(0x4a5a9a), 0.8) });
-        let mut name = s.name.clone();
-        while g.text_w(&name, 15.0, true) > pw - 16.0 && name.chars().count() > 2 {
-            name.pop();
-        }
-        g.text(&name, pos.x, py + 15.0, 15.0, if dim { K_MUTED } else { K_TEXT }, Align::Center, true);
-        let chips_c = if s.all_in { K_ORANGE } else { K_GOLD };
-        g.text(&fmt_chips(s.chips), pos.x, py + 34.0, 17.0, chips_c, Align::Center, true);
-
-        if s.is_bot {
-            g.rrect(pos.x + r - 18.0, pos.y + r - 30.0, 40.0, 18.0, 9.0, rgb(0x34407a));
-            g.text("БОТ", pos.x + r + 2.0, pos.y + r - 21.0, 11.0, K_TEXT, Align::Center, true);
-            if v.host && g.button(pos.x - r - 16.0, pos.y - r, 30.0, 30.0, "×", rgb(0x8a2b35), true) {
-                let mut m = ClientMsg::new("kick");
-                m.seat = seat as u32;
-                self.send(m);
-            }
-        }
-        if !s.connected {
-            g.text_shadow("нет связи", pos.x, pos.y, 14.0, K_RED, Align::Center, true);
+        if s.is_bot && v.host && g.button(px - 14.0, py - 14.0, 28.0, 28.0, "×", rgb(0xd04a6a), true) {
+            let mut m = ClientMsg::new("kick");
+            m.seat = seat as u32;
+            self.send(m);
         }
 
+        // выигрыш / последнее действие над панелью
         if let Some(w) = winner {
             let rise = (since_result * 22.0).min(26.0);
             let label = format!("+{}", fmt_chips(w.amount));
-            g.text_shadow(&label, pos.x, pos.y - r - 18.0 - rise, 24.0, K_GOLD, Align::Center, true);
+            g.text_shadow(&label, pos.x, py - 16.0 - rise, 24.0, K_GOLD, Align::Center, true);
         } else if !s.last_action.is_empty() {
             let a = &s.last_action;
             let c = if a.starts_with("Фолд") {
-                rgb(0x5a6077)
+                rgb(0x6a6f88)
             } else if a.starts_with("Чек") {
-                K_GREEN
+                rgb(0x3ddc84)
             } else if a.starts_with("Колл") {
-                K_BLUE
+                K_CYAN
             } else if a.starts_with("Олл") {
                 K_RED
             } else if a.starts_with("МБ") || a.starts_with("ББ") {
-                rgb(0x3b456b)
+                K_MUTED
             } else {
                 K_ORANGE
             };
             let text = if a.starts_with("Олл") { "ОЛЛ-ИН".to_string() } else { a.clone() };
-            let w = g.text_w(&text, 14.0, true) + 22.0;
-            let by = pos.y - r - 30.0;
-            g.rrect(pos.x - w / 2.0, by, w, 24.0, 12.0, c);
-            g.tri(vec2(pos.x - 6.0, by + 23.0), vec2(pos.x + 6.0, by + 23.0), vec2(pos.x, by + 30.0), c);
-            g.text(&text, pos.x, by + 12.0, 14.0, WHITE, Align::Center, true);
+            let w = g.text_w(&text, 14.0, true) + 24.0;
+            let by = py - 32.0;
+            g.rrect(pos.x - w / 2.0, by, w, 24.0, 12.0, Color::new(0.06, 0.06, 0.15, 0.8));
+            g.glow(pos.x - w / 2.0, by, w, 24.0, 12.0, c, 0.8);
+            g.text(&text, pos.x, by + 12.0, 14.0, lighten(c, 0.4), Align::Center, true);
         }
     }
 
     fn draw_top_bar(&mut self, g: &G, v: &View) {
-        if g.button(14.0, 12.0, 120.0, 42.0, "← Выйти", rgb(0x2b3560), true) {
+        if g.button(14.0, 12.0, 120.0, 42.0, "← Выйти", rgb(0x7a6cff), true) {
             self.confirm_leave = true;
         }
         let mut info = format!("Блайнды {}/{}", fmt_chips(v.sb), fmt_chips(v.bb));
@@ -951,8 +1002,7 @@ impl App {
     fn draw_waiting(&mut self, g: &G, v: &View) {
         let (pw, ph) = (540.0, if v.host { 250.0 } else { 130.0 });
         let (px, py) = (g.w / 2.0 - pw / 2.0, g.h * 0.28 - 30.0);
-        g.rrect(px, py, pw, ph, 20.0, alpha(K_PANEL, 0.94));
-        g.rrect_lines(px, py, pw, ph, 20.0, 2.0, alpha(K_GOLD, 0.6));
+        g.glass(px, py, pw, ph, 20.0, K_NEON, true);
         let seated = v.seats.iter().filter(|s| s.occupied).count();
         if v.host {
             g.text("Стол открыт!", g.w / 2.0, py + 32.0, 24.0, K_GOLD, Align::Center, true);
@@ -965,10 +1015,10 @@ impl App {
             g.text(&addr, g.w / 2.0, py + 102.0, 30.0, WHITE, Align::Center, true);
             let txt = format!("За столом: {} из {}", seated, MAX_SEATS);
             g.text(&txt, g.w / 2.0, py + 142.0, 16.0, K_MUTED, Align::Center, false);
-            if g.button(px + 30.0, py + 170.0, 200.0, 56.0, "+ Бот", rgb(0x34407a), seated < MAX_SEATS) {
+            if g.button(px + 30.0, py + 170.0, 200.0, 56.0, "+ Бот", rgb(0x7a6cff), seated < MAX_SEATS) {
                 self.send(ClientMsg::new("add_bot"));
             }
-            if g.button(px + 246.0, py + 170.0, pw - 276.0, 56.0, "Начать игру", rgb(0x23915a), seated >= 2) {
+            if g.button(px + 246.0, py + 170.0, pw - 276.0, 56.0, "Начать игру", K_NEON, seated >= 2) {
                 self.send(ClientMsg::new("start"));
             }
         } else {
@@ -988,13 +1038,12 @@ impl App {
         let bet_word = if v.current_bet == 0 { "Бет" } else { "Рейз" };
         self.raise_to = self.raise_to.clamp(lo, hi);
         let (bw, bh, gap) = (132.0, 66.0, 8.0);
-        let bx = g.w - 3.0 * bw - 2.0 * gap - 14.0;
+        let bx = g.w / 2.0 - (3.0 * bw + 2.0 * gap) / 2.0;
         let by = g.h - bh - 14.0;
 
         if self.raise_open && v.can_raise {
             let (px, py, pw, ph) = (bx, by - 108.0, 3.0 * bw + 2.0 * gap, 98.0);
-            g.rrect(px, py, pw, ph, 14.0, K_PANEL);
-            g.rrect_lines(px, py, pw, ph, 14.0, 1.5, alpha(K_GOLD, 0.4));
+            g.glass(px, py, pw, ph, 14.0, K_NEON, false);
             let pot = v.pot;
             let quick = [
                 ("Мин", lo),
@@ -1005,7 +1054,7 @@ impl App {
             let qw = (pw - 20.0 - 3.0 * 6.0) / 4.0;
             for (k, (label, val)) in quick.iter().enumerate() {
                 let x = px + 10.0 + k as f32 * (qw + 6.0);
-                if g.button(x, py + 10.0, qw, 34.0, label, rgb(0x34407a), true) {
+                if g.button(x, py + 10.0, qw, 34.0, label, rgb(0x7a6cff), true) {
                     self.raise_to = (*val).clamp(lo, hi);
                 }
             }
@@ -1051,17 +1100,17 @@ impl App {
             format!("{} {}", bet_word, fmt_chips(self.raise_to))
         };
 
-        if g.button(bx, by, bw, bh, "Фолд", rgb(0xc0303c), true) || is_key_pressed(KeyCode::F) {
+        if g.button(bx, by, bw, bh, "Фолд", K_NEON, true) || is_key_pressed(KeyCode::F) {
             // фолд без ставки превращаем в чек
             self.act(if to_call == 0 { 1 } else { 0 }, 0);
             return;
         }
-        let call_c = if to_call == 0 { rgb(0x23915a) } else { rgb(0x2a6fd6) };
+        let call_c = K_CYAN;
         if g.button(bx + bw + gap, by, bw, bh, &call_label, call_c, true) || is_key_pressed(KeyCode::C) {
             self.act(if to_call == 0 { 1 } else { 2 }, 0);
             return;
         }
-        let raise = g.button(bx + 2.0 * (bw + gap), by, bw, bh, &raise_label, rgb(0xe08a1a), v.can_raise);
+        let raise = g.button(bx + 2.0 * (bw + gap), by, bw, bh, &raise_label, K_NEON, v.can_raise);
         if raise || (v.can_raise && is_key_pressed(KeyCode::R)) {
             if self.raise_open {
                 let amt = self.raise_to;
@@ -1080,13 +1129,13 @@ impl App {
         g.rect(0.0, 0.0, g.w, g.h, alpha(BLACK, 0.6));
         let (w, h) = (480.0, 220.0);
         let (x, y) = (g.w / 2.0 - w / 2.0, g.h / 2.0 - h / 2.0);
-        g.rrect(x, y, w, h, 20.0, rgb(0x111830));
-        g.rrect_lines(x, y, w, h, 20.0, 2.0, K_GOLD);
+        g.rrect(x, y, w, h, 20.0, Color::new(0.04, 0.04, 0.1, 0.9));
+        g.glass(x, y, w, h, 20.0, K_NEON, true);
         g.text("Покинуть стол?", g.w / 2.0, y + 44.0, 26.0, K_GOLD, Align::Center, true);
         let msg = if v.host { "Вы хост — стол закроется для всех" } else { "Ваше место освободится" };
         g.text(msg, g.w / 2.0, y + 92.0, 17.0, K_TEXT, Align::Center, false);
-        let stay = g.button(x + 30.0, y + 134.0, 195.0, 58.0, "Остаться", rgb(0x2b3560), true);
-        let go = g.button(x + w - 225.0, y + 134.0, 195.0, 58.0, "Выйти", rgb(0xc0303c), true);
+        let stay = g.button(x + 30.0, y + 134.0, 195.0, 58.0, "Остаться", rgb(0x7a6cff), true);
+        let go = g.button(x + w - 225.0, y + 134.0, 195.0, 58.0, "Выйти", K_RED, true);
         g.eat_click();
         if stay {
             self.confirm_leave = false;
@@ -1098,9 +1147,6 @@ impl App {
 
     fn frame(&mut self, g: &G) {
         self.handle_typing();
-        // очищает и цвет, и буфер глубины — без этого 3D не рисуется
-        clear_background(rgb(0x04060d));
-        self.draw_background(g);
         if self.screen == Screen::Table {
             self.poll();
         }
@@ -1112,66 +1158,69 @@ impl App {
     }
 }
 
-fn window_conf() -> macroquad::conf::Conf {
-    // STRAWBERRY_WINDOW=2400x1080 — проверить вид на другом экране
-    let (w, h) = std::env::var("STRAWBERRY_WINDOW")
-        .ok()
-        .and_then(|s| s.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
-        .unwrap_or((1280, 720));
-    macroquad::conf::Conf {
-        miniquad_conf: Conf {
-            window_title: "Strawberry Poker".to_string(),
-            window_width: w,
-            window_height: h,
-            high_dpi: true,
-            // на Android не все GPU отдают MSAA-конфигурацию, а miniquad без неё падает
-            sample_count: if cfg!(target_os = "android") { 1 } else { 4 },
-            window_resizable: true,
-            ..Default::default()
-        },
-        // меши стола крупные — увеличиваем буфер одного вызова отрисовки
-        draw_call_vertex_capacity: 40_000,
-        draw_call_index_capacity: 80_000,
-        ..Default::default()
+// ---------------------------------------------------------------- цикл приложения
+
+struct Stage {
+    renderer: Renderer,
+    canvas: RefCell<Canvas>,
+    app: App,
+    shot: Option<(String, f64)>,
+    autostart: bool,
+    autoplay: bool,
+}
+
+impl Stage {
+    fn new() -> Stage {
+        input::init();
+        let mut renderer = Renderer::new();
+        let canvas = RefCell::new(Canvas::new(
+            &[include_bytes!("../assets/DejaVuSans.ttf"), include_bytes!("../assets/DejaVuSans-Bold.ttf")],
+            2,
+        ));
+        let scene = Scene::new(&mut renderer, &canvas);
+        let mut app = App::new(scene);
+
+        // Отладка: STRAWBERRY_SHOT=файл.ppm:секунды[:host|hostsetup|joinsetup|join=адрес]
+        let mut shot = None;
+        if let Ok(spec) = std::env::var("STRAWBERRY_SHOT") {
+            let parts: Vec<&str> = spec.splitn(3, ':').collect();
+            let secs: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            match parts.get(2).copied() {
+                Some("host") => app.host_game(),
+                Some(other) if other.starts_with("join=") => {
+                    app.settings.last_ip = other[5..].to_string();
+                    app.join_game();
+                }
+                Some("hostsetup") => app.screen = Screen::Host,
+                Some("joinsetup") => app.screen = Screen::Join,
+                _ => {}
+            }
+            shot = Some((parts[0].to_string(), secs));
+        }
+        Stage {
+            renderer,
+            canvas,
+            app,
+            shot,
+            autostart: std::env::var("STRAWBERRY_AUTOSTART").is_ok(),
+            autoplay: std::env::var("STRAWBERRY_AUTOPLAY").is_ok(),
+        }
     }
 }
 
-#[macroquad::main(window_conf)]
-async fn main() {
-    let font = load_ttf_font_from_bytes(include_bytes!("../assets/DejaVuSans.ttf")).unwrap();
-    let bold = load_ttf_font_from_bytes(include_bytes!("../assets/DejaVuSans-Bold.ttf")).unwrap();
-    let scene = Scene::new(&font, &bold);
-    let mut app = App::new(scene);
+impl EventHandler for Stage {
+    fn update(&mut self) {}
 
-    // Отладка: STRAWBERRY_SHOT=файл.png:секунды[:host|hostsetup|joinsetup|join=адрес]
-    let mut shot: Option<(String, f64)> = None;
-    if let Ok(spec) = std::env::var("STRAWBERRY_SHOT") {
-        let parts: Vec<&str> = spec.splitn(3, ':').collect();
-        let secs: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.0);
-        match parts.get(2).copied() {
-            Some("host") => app.host_game(),
-            Some(other) if other.starts_with("join=") => {
-                app.settings.last_ip = other[5..].to_string();
-                app.join_game();
-            }
-            Some("hostsetup") => app.screen = Screen::Host,
-            Some("joinsetup") => app.screen = Screen::Join,
-            _ => {}
-        }
-        shot = Some((parts[0].to_string(), secs));
-    }
-    let autostart = std::env::var("STRAWBERRY_AUTOSTART").is_ok();
-
-    loop {
-        let g = G::new(&font, &bold);
-        if autostart {
+    fn draw(&mut self) {
+        let app = &mut self.app;
+        if self.autostart {
             if let Some(v) = app.net.as_ref().and_then(|n| n.view.as_ref()) {
                 if v.host && !v.started && v.seats.iter().filter(|s| s.occupied).count() >= 2 {
                     app.send(ClientMsg::new("start"));
                 }
             }
         }
-        if std::env::var("STRAWBERRY_AUTOPLAY").is_ok() {
+        if self.autoplay {
             if let Some(v) = app.net.as_ref().and_then(|n| n.view.as_ref()) {
                 if v.you >= 0 && v.to_act == v.you && v.result.is_none() && (get_time() as i64) % 2 == 0 {
                     let mut m = ClientMsg::new("act");
@@ -1180,13 +1229,67 @@ async fn main() {
                 }
             }
         }
-        app.frame(&g);
-        if let Some((path, secs)) = &shot {
+        self.canvas.borrow_mut().begin();
+        {
+            let g = G::new(&self.canvas);
+            app.frame(&g);
+        }
+        let cmds = app.scene.take_cmds();
+        let cam = app.camera;
+        let light = app.scene.light;
+        self.renderer.frame(&mut self.canvas.borrow_mut(), rgb(0x05040c), Some(&cam), &light, &cmds);
+        input::end_frame();
+        if let Some((path, secs)) = &self.shot {
             if get_time() > *secs {
-                get_screen_data().export_png(path);
-                break;
+                self.renderer.screenshot(path);
+                miniquad::window::order_quit();
+                self.shot = None;
             }
         }
-        next_frame().await
     }
+
+    fn mouse_motion_event(&mut self, x: f32, y: f32) {
+        input::on_move(x, y);
+    }
+    fn mouse_wheel_event(&mut self, _x: f32, y: f32) {
+        input::on_wheel(y);
+    }
+    fn mouse_button_down_event(&mut self, _b: MouseButton, x: f32, y: f32) {
+        input::on_down(x, y);
+    }
+    fn mouse_button_up_event(&mut self, _b: MouseButton, x: f32, y: f32) {
+        input::on_up(x, y);
+    }
+    fn touch_event(&mut self, phase: TouchPhase, _id: u64, x: f32, y: f32) {
+        match phase {
+            TouchPhase::Started => input::on_down(x, y),
+            TouchPhase::Moved => input::on_move(x, y),
+            TouchPhase::Ended | TouchPhase::Cancelled => input::on_up(x, y),
+        }
+    }
+    fn char_event(&mut self, c: char, _m: KeyMods, _repeat: bool) {
+        input::on_char(c);
+    }
+    fn key_down_event(&mut self, k: KeyCode, _m: KeyMods, _repeat: bool) {
+        input::on_key(k);
+    }
+}
+
+fn main() {
+    // STRAWBERRY_WINDOW=2400x1080 — проверить вид на другом экране
+    let (w, h) = std::env::var("STRAWBERRY_WINDOW")
+        .ok()
+        .and_then(|s| s.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
+        .unwrap_or((1280, 720));
+    let conf = Conf {
+        window_title: "Strawberry Poker".to_string(),
+        window_width: w,
+        window_height: h,
+        high_dpi: true,
+        // на Android не все GPU отдают MSAA-конфигурацию, а miniquad без неё падает
+        sample_count: if cfg!(target_os = "android") { 1 } else { 4 },
+        window_resizable: true,
+        ..Default::default()
+    };
+    miniquad::start(conf, || Box::new(Stage::new()));
 }
